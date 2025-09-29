@@ -1,40 +1,93 @@
-import boto3
-import mysql.connector
+import os
 import csv
+import boto3
+import botocore
+import mysql.connector
+from mysql.connector import Error
 
-# Configuración de MySQL
-db_config = {
-    'host': 'localhost',  # Si MySQL está en la misma instancia EC2, usa 'localhost' o '127.0.0.1'
-    'user': 'usuario',    # Reemplaza con el nombre de usuario de MySQL que creaste
-    'password': 'contraseña',  # Reemplaza con la contraseña del usuario MySQL
-    'database': 'nombre_base_datos'  # Reemplaza con el nombre de la base de datos que deseas usar
-}
+# --- MySQL ---
+DB_HOST = os.getenv("MYSQL_HOST", "host.docker.internal")
+DB_USER = os.getenv("MYSQL_USER", "usuario")
+DB_PASS = os.getenv("MYSQL_PASSWORD", "contraseña")
+DB_NAME = os.getenv("MYSQL_DATABASE", "nombre_base_datos")
+DB_TABLE = os.getenv("MYSQL_TABLE", "nombre_tabla")
 
-# Configuración de S3
-ficheroUpload = "data.csv"  # El nombre del archivo CSV que se subirá
-nombreBucket = "gcr-output-01"  # Reemplaza con tu bucket S3
+# --- S3 ---
+BUCKET = os.getenv("S3_BUCKET", "joelxd-storage")  # <-- cambia si quieres otro
+CSV_OUT = os.getenv("CSV_FILENAME", "data_2.csv")
+AWS_REGION = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
 
-# Conexión a MySQL
-conexion = mysql.connector.connect(**db_config)
-cursor = conexion.cursor()
+def ensure_bucket(bucket: str, region: str):
+    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3.head_bucket(Bucket=bucket)
+        print(f"Bucket '{bucket}' existe.")
+        return
+    except botocore.exceptions.ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        # 404 / NoSuchBucket => lo creamos
+        if code in ("404", "NoSuchBucket", "NotFound"):
+            print(f"Bucket '{bucket}' no existe. Creándolo en región {region}...")
+            if region == "us-east-1":
+                s3.create_bucket(Bucket=bucket)
+            else:
+                s3.create_bucket(
+                    Bucket=bucket,
+                    CreateBucketConfiguration={"LocationConstraint": region},
+                )
+            # esperar a que esté listo
+            waiter = s3.get_waiter("bucket_exists")
+            waiter.wait(Bucket=bucket)
+            print(f"Bucket '{bucket}' creado.")
+        else:
+            raise
 
-# Consultar la base de datos y obtener los registros de la tabla
-query = "SELECT * FROM nombre_tabla"  # Cambia 'nombre_tabla' por la tabla que deseas leer
-cursor.execute(query)
+def main():
+    conn = None
+    cursor = None
+    try:
+        # Conexión a MySQL
+        conn = mysql.connector.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME
+        )
+        cursor = conn.cursor()
+        query = f"SELECT * FROM {DB_TABLE}"
+        cursor.execute(query)
 
-# Guardar los registros en un archivo CSV
-with open(ficheroUpload, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    # Escribir el encabezado del CSV (opcional, solo si es necesario)
-    writer.writerow([desc[0] for desc in cursor.description])  # Escribe los nombres de las columnas
-    # Escribir las filas
-    writer.writerows(cursor.fetchall())
+        rows = cursor.fetchall()
+        headers = [desc[0] for desc in cursor.description] if cursor.description else []
 
-# Subir el archivo CSV a S3
-s3 = boto3.client('s3')
-response = s3.upload_file(ficheroUpload, nombreBucket, ficheroUpload)
-print("Ingesta completada:", response)
+        # Escribir CSV
+        with open(CSV_OUT, mode='w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if headers:
+                writer.writerow(headers)
+            for row in rows:
+                writer.writerow(row)
 
-# Cerrar la conexión
-cursor.close()
-conexion.close()
+        print(f"CSV generado: {CSV_OUT} ({len(rows)} filas).")
+
+        # S3: asegurar bucket y subir
+        ensure_bucket(BUCKET, AWS_REGION)
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        s3.upload_file(CSV_OUT, BUCKET, CSV_OUT)
+        print(f"Ingesta completada. Subido s3://{BUCKET}/{CSV_OUT} (región {AWS_REGION})")
+
+    except Error as e:
+        print("Error de MySQL:", e)
+        raise
+    except botocore.exceptions.ClientError as e:
+        print("Error de S3:", e)
+        raise
+    except Exception as e:
+        print("Error general:", e)
+        raise
+    finally:
+        try:
+            if cursor: cursor.close()
+            if conn: conn.close()
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
